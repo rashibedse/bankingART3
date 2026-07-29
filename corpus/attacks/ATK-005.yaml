@@ -1,6 +1,9 @@
 id: ATK-005
 category: poisoned_input
 severity: high
+family: poisoned_input
+surface: file
+cost: cheap
 description: Evasion attack using zero-width characters to break up keywords and slip past naive filters.
 expected_hook: before
 

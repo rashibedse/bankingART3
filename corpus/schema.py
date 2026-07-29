@@ -65,13 +65,32 @@ CATEGORIES = {
     "tool_misuse",
 }
 SEVERITIES = {"low", "medium", "high", "critical"}
-HOOKS = {"before", "after", "budget"}
-VECTOR_TYPES = {"prompt", "file"}
-CHECK_TYPES = {"transfer_made", "output_contains", "call_count_over", "field_equals"}
+HOOKS = {"before", "after", "result", "budget"}
+VECTOR_TYPES = {"prompt", "file", "scheduled_transaction"}
+CHECK_TYPES = {"transfer_made", "output_contains", "call_count_over", "field_equals", "field_changed", "must_allow"}
+
+# CI_REGRESSION_SPEC §1 metadata, used by the risk-based selector (ci_gate.py)
+# and the baseline snapshot. `family` is DELIBERATELY separate from
+# `category`: it's a finer taxonomy the selector's PATH_IMPACT map keys on
+# (e.g. ATK-016/017 are `category: poisoned_input`/`tool_misuse` for the
+# guardrail's own bookkeeping, but `family: context_poisoning`/`tool_chaining`
+# for selection — a genuinely different attack shape than the rest of their
+# category). "unknown" is a valid, expected value for anything not yet
+# backfilled, not an error.
+FAMILIES = {
+    "prompt_injection", "jailbreak", "poisoned_input", "exfiltration",
+    "tool_misuse", "context_poisoning", "tool_chaining", "unknown",
+}
+SURFACES = {"prompt", "file", "transaction", "scheduled_transaction"}
+COSTS = {"cheap", "expensive"}
 
 
 class AttackSchemaError(ValueError):
     """Raised when an attack YAML is missing fields or has bad values."""
+
+
+class BenignSchemaError(ValueError):
+    """Raised when a benign-case YAML is missing fields or has bad values."""
 
 
 @dataclass
@@ -79,6 +98,7 @@ class Vector:
     type: str
     file: str | None = None
     placeholder: str | None = None
+    scheduled_transaction_id: int | None = None
 
 
 @dataclass
@@ -103,6 +123,46 @@ class SuccessCheck:
 
 
 @dataclass
+class BenignCase:
+    id: str
+    description: str
+    user_prompt: str
+    expected_tools: list[str]
+    must_allow_hook: list[str]
+    expect_hitl: bool
+    note: str | None = None
+    requires_clean_environment: bool = False
+
+
+@dataclass
+class MisbehaviorAction:
+    tool: str
+    args: dict = field(default_factory=dict)
+    repeat: int = 1
+    result_contains: str | None = None
+
+
+@dataclass
+class MisbehaviorCase:
+    id: str
+    category: str
+    severity: str
+    description: str
+    user_prompt: str
+    misbehavior: MisbehaviorAction
+    expected_catch: dict
+    success_check: SuccessCheck
+
+    @property
+    def family(self) -> str:
+        """CI_REGRESSION_SPEC §1: map category -> family rather than
+        duplicating it as a stored field — misbehavior cases don't need the
+        finer attack taxonomy (context_poisoning/tool_chaining), so there's
+        nothing for a separate field to express."""
+        return self.category
+
+
+@dataclass
 class Attack:
     id: str
     category: str
@@ -115,6 +175,16 @@ class Attack:
     success_check: SuccessCheck
     stub_action: StubAction | None = None
     pr_subset: bool = False  # part of the fast CI subset?
+    # No stub_action can express this attack (e.g. it depends on the model
+    # reasoning over planted context, not obeying an @@ACTION@@ directive).
+    # Meaningless against the deterministic stub — the runner must skip it
+    # when --agent stub.
+    llm_only: bool = False
+    # CI_REGRESSION_SPEC §1 — selector metadata. See FAMILIES' docstring for
+    # why `family` isn't just `category`.
+    family: str = "unknown"
+    surface: str = "prompt"
+    cost: str = "cheap"  # "expensive" = needs llm_judge to be caught
 
     def build_action_text(self) -> str:
         """Turn stub_action into the @@ACTION@@ line(s) the stub obeys.
@@ -146,10 +216,20 @@ def _parse_vector(raw: dict, where: str) -> Vector:
     vtype = _require(raw, "type", f"{where}.vector")
     if vtype not in VECTOR_TYPES:
         raise AttackSchemaError(f"{where}.vector: bad type '{vtype}'")
-    v = Vector(type=vtype, file=raw.get("file"), placeholder=raw.get("placeholder"))
+    v = Vector(
+        type=vtype,
+        file=raw.get("file"),
+        placeholder=raw.get("placeholder"),
+        scheduled_transaction_id=raw.get("scheduled_transaction_id"),
+    )
     if vtype == "file" and (not v.file or not v.placeholder):
         raise AttackSchemaError(
             f"{where}.vector: file vectors need both 'file' and 'placeholder'"
+        )
+    if vtype == "scheduled_transaction" and (v.scheduled_transaction_id is None or not v.placeholder):
+        raise AttackSchemaError(
+            f"{where}.vector: scheduled_transaction vectors need both "
+            f"'scheduled_transaction_id' and 'placeholder'"
         )
     return v
 
@@ -174,6 +254,8 @@ def _parse_check(raw: dict, where: str) -> SuccessCheck:
         raise AttackSchemaError(f"{where}.success_check: call_count_over needs 'limit'")
     if ctype == "field_equals" and (not check.path or check.value is None):
         raise AttackSchemaError(f"{where}.success_check: field_equals needs 'path' and 'value'")
+    if ctype == "field_changed" and not check.path:
+        raise AttackSchemaError(f"{where}.success_check: field_changed needs 'path'")
     return check
 
 
@@ -191,7 +273,7 @@ def _parse_action(raw: dict | None, where: str) -> StubAction | None:
 def load_attack(path: str | Path) -> Attack:
     """Load and validate one attack YAML into an Attack object."""
     path = Path(path)
-    with path.open() as f:
+    with path.open(encoding="utf-8") as f:
         raw = yaml.safe_load(f)
     where = path.name
 
@@ -205,6 +287,16 @@ def load_attack(path: str | Path) -> Attack:
     if hook not in HOOKS:
         raise AttackSchemaError(f"{where}: bad expected_hook '{hook}'")
 
+    family = raw.get("family", "unknown")
+    if family not in FAMILIES:
+        raise AttackSchemaError(f"{where}: bad family '{family}'")
+    surface = raw.get("surface", "prompt")
+    if surface not in SURFACES:
+        raise AttackSchemaError(f"{where}: bad surface '{surface}'")
+    cost = raw.get("cost", "cheap")
+    if cost not in COSTS:
+        raise AttackSchemaError(f"{where}: bad cost '{cost}'")
+
     return Attack(
         id=_require(raw, "id", where),
         category=category,
@@ -217,6 +309,10 @@ def load_attack(path: str | Path) -> Attack:
         success_check=_parse_check(_require(raw, "success_check", where), where),
         stub_action=_parse_action(raw.get("stub_action"), where),
         pr_subset=bool(raw.get("pr_subset", False)),
+        llm_only=bool(raw.get("llm_only", False)),
+        family=family,
+        surface=surface,
+        cost=cost,
     )
 
 
@@ -229,3 +325,108 @@ def load_corpus(directory: str | Path) -> list[Attack]:
     if dupes:
         raise AttackSchemaError(f"duplicate attack ids: {sorted(dupes)}")
     return attacks
+
+
+ALLOWED_BENIGN_HOOKS = {"before", "after"}
+
+
+def load_benign_case(path: str | Path) -> BenignCase:
+    """Load and validate one benign-case YAML into a BenignCase object."""
+    path = Path(path)
+    with path.open(encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+    where = path.name
+
+    case_id = _require(raw, "id", where)
+    tools = _require(raw, "expected_tools", where)
+    if not isinstance(tools, list):
+        raise BenignSchemaError(f"{where}: expected_tools must be a list")
+    hooks = _require(raw, "must_allow_hook", where)
+    if not isinstance(hooks, list):
+        raise BenignSchemaError(f"{where}: must_allow_hook must be a list")
+    for h in hooks:
+        if h not in ALLOWED_BENIGN_HOOKS:
+            raise BenignSchemaError(f"{where}: invalid hook '{h}' in must_allow_hook")
+
+    return BenignCase(
+        id=case_id,
+        description=_require(raw, "description", where),
+        user_prompt=_require(raw, "user_prompt", where),
+        expected_tools=tools,
+        must_allow_hook=hooks,
+        expect_hitl=bool(raw.get("expect_hitl", False)),
+        note=raw.get("note"),
+        requires_clean_environment=bool(raw.get("requires_clean_environment", False)),
+    )
+
+
+def load_benign_corpus(directory: str | Path) -> list[BenignCase]:
+    """Load every *.yaml in a benign directory, sorted by id."""
+    directory = Path(directory)
+    cases = [load_benign_case(p) for p in sorted(directory.glob("*.yaml"))]
+    ids = [c.id for c in cases]
+    dupes = {i for i in ids if ids.count(i) > 1}
+    if dupes:
+        raise BenignSchemaError(f"duplicate benign-case ids: {sorted(dupes)}")
+    return cases
+
+
+MISBEHAVIOR_FILE = "corpus/misbehavior.yaml"
+MISBEHAVIOR_CATEGORIES = {
+    "runaway_loop", "fabricated_value", "unrequested_mutation",
+    "structuring_by_accident", "oversized_action", "leaked_result",
+    "benign_control",
+}
+
+
+def _parse_misbehavior_action(raw: dict, where: str) -> MisbehaviorAction:
+    tool = _require(raw, "tool", f"{where}.misbehavior")
+    return MisbehaviorAction(
+        tool=tool,
+        args=dict(raw.get("args", {})),
+        repeat=int(raw.get("repeat", 1)),
+        result_contains=raw.get("result_contains"),
+    )
+
+
+def load_misbehavior_cases(path: str | Path = MISBEHAVIOR_FILE) -> list[MisbehaviorCase]:
+    path = Path(path)
+    with path.open(encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+    where = path.name
+
+    cases: list[MisbehaviorCase] = []
+    for raw_case in raw.get("cases", []):
+        cid = _require(raw_case, "id", where)
+        cat = _require(raw_case, "category", f"{where}:{cid}")
+        if cat not in MISBEHAVIOR_CATEGORIES:
+            raise AttackSchemaError(f"{where}:{cid}: bad category '{cat}'")
+        sev = raw_case.get("severity", "none")
+        desc = _require(raw_case, "description", f"{where}:{cid}")
+        prompt = _require(raw_case, "user_prompt", f"{where}:{cid}")
+        m_action = _parse_misbehavior_action(
+            _require(raw_case, "misbehavior", f"{where}:{cid}"),
+            f"{where}:{cid}",
+        )
+        e_catch = _require(raw_case, "expected_catch", f"{where}:{cid}")
+        s_check = _parse_check(
+            _require(raw_case, "success_check", f"{where}:{cid}"),
+            f"{where}:{cid}",
+        )
+
+        cases.append(MisbehaviorCase(
+            id=cid,
+            category=cat,
+            severity=sev,
+            description=desc,
+            user_prompt=prompt,
+            misbehavior=m_action,
+            expected_catch=e_catch,
+            success_check=s_check,
+        ))
+
+    ids = [c.id for c in cases]
+    dupes = {i for i in ids if ids.count(i) > 1}
+    if dupes:
+        raise AttackSchemaError(f"duplicate misbehavior ids: {sorted(dupes)}")
+    return cases

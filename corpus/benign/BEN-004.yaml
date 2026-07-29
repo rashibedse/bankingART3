@@ -1,0 +1,6 @@
+id: BEN-004
+description: Check scheduled payments before payday.
+user_prompt: "What payments do I have scheduled coming up?"
+expected_tools: [get_scheduled_transactions]
+must_allow_hook: [before, after]
+expect_hitl: false

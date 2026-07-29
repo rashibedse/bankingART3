@@ -1,0 +1,120 @@
+# Guardrail CI — CI_REGRESSION_SPEC.md §7.
+#
+# Two tiers, deliberately asymmetric (see CI_REGRESSION_SPEC.md §0):
+#   pr-gate               stub agent, deterministic -> BLOCKS the PR on regression.
+#   nightly-deep-scan     llm agent, real model      -> NEVER blocks anything;
+#                         report + artifact + trend data only.
+# The stub is the blocking tier precisely because it's deterministic — an
+# LLM-mode gate would fail PRs on model-sampling noise, not real regressions.
+#
+# Human setup required before this workflow is fully live — see the
+# CI_REGRESSION_SPEC.md §8 list (requirements.txt, OPENROUTER_API_KEY secret,
+# the first committed corpus/baseline.json, etc). Until requirements.txt
+# exists, the install step below will fail — that's expected, not a bug here.
+
+name: Guardrail CI
+
+on:
+  pull_request:
+    branches: [master]
+  schedule:
+    - cron: "0 6 * * *"  # nightly deep scan, 06:00 UTC
+  workflow_dispatch: {}   # manual trigger — also how you prove the gate fires (§8#8)
+
+permissions:
+  contents: read
+
+jobs:
+  pr-gate:
+    name: PR gate (stub, blocking)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # The risk-based selector (§3) needs history to run
+          # `git diff origin/<base>...HEAD` — a shallow checkout would make
+          # every PR look like "changed files unknown" and select broadly
+          # every time, silently defeating context reduction.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run PR gate
+        # stub agent: deterministic, makes no API calls — no
+        # OPENROUTER_API_KEY needed. This is the free/offline half of the
+        # story worth stating explicitly: the blocking gate costs nothing.
+        run: |
+          python runner/ci_gate.py \
+            --mode pr \
+            --agent stub \
+            --base-ref "origin/${{ github.base_ref }}"
+
+      - name: Upload ci_report.json
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-report-pr-${{ github.run_id }}
+          path: ci_report.json
+          if-no-files-found: warn
+
+      - name: Upload .ci_gate_tmp
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-gate-tmp-pr-${{ github.run_id }}
+          path: .ci_gate_tmp/
+          if-no-files-found: warn
+
+  nightly-deep-scan:
+    name: Nightly deep scan (llm, non-blocking)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run nightly deep scan
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        # Real-model results are nondeterministic by nature (§0) — this
+        # step reports and uploads a trend artifact but must never fail
+        # the workflow/block anything downstream.
+        continue-on-error: true
+        run: |
+          python runner/ci_gate.py \
+            --mode full \
+            --agent llm
+
+      - name: Upload ci_report.json
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-report-nightly-${{ github.run_id }}
+          path: ci_report.json
+          if-no-files-found: warn
+
+      - name: Upload .ci_gate_tmp
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-gate-tmp-nightly-${{ github.run_id }}
+          path: .ci_gate_tmp/
+          if-no-files-found: warn

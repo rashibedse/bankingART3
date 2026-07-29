@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(python -c \"import sys; print\\(sys.executable\\)\")",
-      "Bash(python -m pip show groq)"
+      "Bash(python -m pip show groq)",
+      "Bash(python runner/run.py --guardrail on --agent stub --out sanity_guarded2.json)",
+      "Bash(python runner/baseline.py --compare results/sanity_guarded2.json --baseline results/_scratch_baseline.json)",
+      "Bash(echo \"exit code: $?\")"
     ]
   }
 }

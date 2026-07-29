@@ -47,6 +47,12 @@ class ToolCall:
     """One action the agent wants to take: a tool name + its arguments."""
     name: str
     args: dict
+    # Populated by executors that already ran this call for real (llm_agent's
+    # multi-round loop executes mid-conversation so the model can see
+    # results). When set, callers must reuse it instead of calling the tool
+    # again — re-invoking a mutating tool (send_money, update_password...)
+    # would apply its effect twice.
+    result: object = None
 
 
 @dataclass

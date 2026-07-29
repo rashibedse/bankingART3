@@ -1,38 +1,32 @@
 """
-Human-in-the-loop check (after-hook component).
+Backward-compatible shim.
 
-Real systems pause and wait for a human to approve a sensitive action
-(moving money, changing a password). This test suite runs offline with no
-human present, so per policy: requires_approval is treated as a BLOCK for
-scoring purposes, but tagged with its own verdict name (not lumped in with
-content-filter or PII blocks) so the dashboard can show it as its own layer.
+The SENSITIVE_TOOLS set that used to be hardcoded here was the single most
+banking-specific thing in the whole guardrail package — it named this
+project's tools inside supposedly domain-agnostic code. It now lives in
+policy.yaml under the human_in_loop policy's params.tools.
 
-This check acts on the agent's DECIDED TOOL CALLS, not on text — it's the
-backstop layer: even if content_filter and PII miss the attack entirely
-(no keyword, no PII shape), any call to a sensitive tool still gets caught
-here. This is the "defense in depth" argument for stacking: a single
-missed layer isn't a full miss if a later layer independently catches the
-same call by a different signal (tool identity, not text pattern).
+That move is also the ATK-014 fix: adding update_user_info to the guarded
+set is a one-line policy edit, reviewable in a diff, rather than a code change.
 """
 
 from __future__ import annotations
 
-# Tools that move money, change credentials, or otherwise commit the user
-# to something — generic by tool SHAPE (mutates account state), not tied
-# to any specific attack.
-SENSITIVE_TOOLS = {
-    "send_money",
-    "update_password",
-    "schedule_transaction",
-    "update_scheduled_transaction",
-}
+from guardrail.registry import GuardContext, sensitive_tool_call
+
+_POLICY_ID = "human_in_loop"
 
 
-def check(tool_calls: list) -> tuple[bool, str]:
-    """tool_calls: list of objects with a `.name` attribute (banking.agent.ToolCall).
-    Return (triggered, reason) — triggered=True if any call touches a
-    sensitive tool and therefore requires approval."""
-    for call in tool_calls:
-        if call.name in SENSITIVE_TOOLS:
-            return True, f"sensitive tool call requires approval: {call.name}"
-    return False, ""
+def sensitive_tools(policy_path=None) -> set:
+    """The currently-guarded tool set, read from the active policy."""
+    from guardrail.core import load
+    for p in load(policy_path).policies:
+        if p.id == _POLICY_ID:
+            return set(p.params.get("tools", []))
+    return set()
+
+
+def check(tool_calls: list, policy_path=None) -> tuple[bool, str]:
+    """(triggered, reason) — triggered if any call touches a sensitive tool."""
+    ctx = GuardContext(tool_calls=tool_calls or [])
+    return sensitive_tool_call(ctx, {"tools": list(sensitive_tools(policy_path))})

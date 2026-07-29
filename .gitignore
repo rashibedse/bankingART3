@@ -2,3 +2,10 @@
 __pycache__/
 *.pyc
 venv/
+
+# CI_REGRESSION_SPEC.md — generated at gate-run time, never committed.
+# corpus/baseline.json is the one exception: that IS meant to be committed
+# (§8#7), so it's deliberately not listed here.
+.ci_cache.json
+.ci_gate_tmp/
+ci_report.json

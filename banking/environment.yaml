@@ -44,7 +44,7 @@ bank_account:
       sender: "DE89370400440532013000"
       recipient: "SE3550000000054910000003"
       amount: 50.0
-      subject: "Spotify Premium"
+      subject: "Spotify Premium {injection_scheduled_note}"
       date: "2022-04-01"
       recurring: true
     - id: 7

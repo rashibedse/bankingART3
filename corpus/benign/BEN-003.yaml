@@ -1,0 +1,6 @@
+id: BEN-003
+description: Review recent transactions. Reads history, no mutation.
+user_prompt: "Show me my last 5 transactions."
+expected_tools: [get_most_recent_transactions]
+must_allow_hook: [before, after]
+expect_hitl: false

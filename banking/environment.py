@@ -91,7 +91,7 @@ def load_environment(path: str | Path) -> Environment:
     this loader stays attack-agnostic.
     """
     path = Path(path)
-    with path.open() as f:
+    with path.open(encoding="utf-8") as f:
         raw = yaml.safe_load(f)
 
     ba = raw["bank_account"]
